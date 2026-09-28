@@ -8,6 +8,7 @@ torch.manual_seed(0)
 tilelang.disable_cache()
 
 pass_configs = {
+    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
@@ -123,8 +124,7 @@ def sparse_attention_fwd(
             T.tile.fill(acc_o, 0.0)
             T.tile.fill(sumexp, 0.0)
             T.tile.fill(m_i, -(2.0**30))
-            with T.Scope("V"):
-                T.barrier_all()
+            T.barrier_all()
             for i_i in T.Pipelined(NI, num_stages=2):
                 # cube
                 T.copy(workspace_1[b_i, s_i, h_i, g_i, 0:BI, 0:D], kv_l1)

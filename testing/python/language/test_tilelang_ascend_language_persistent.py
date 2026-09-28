@@ -16,8 +16,7 @@ def _persistent_kernel(rows, cols=2):
     def main(O: T.Tensor((rows, cols), "int32")):
         with T.Kernel(WAVE_SIZE, is_npu=True) as (cid, _):
             for row, col in T.Persistent([rows, cols], WAVE_SIZE, cid):
-                with T.Scope("C"):
-                    O[row, col] = row * cols + col
+                O[row, col] = row * cols + col
 
     return main
 
@@ -146,5 +145,4 @@ def test_partial_single_wave_guard_reaches_codegen(target):
 def test_multi_wave_break_guard_reaches_codegen(target):
     artifact = tilelang.lower(_persistent_kernel(11), target=target)
 
-    # C/V separation may retain the loop guard in both execution branches.
-    assert "break;" in artifact.kernel_source
+    assert artifact.kernel_source.count("break;") == 1

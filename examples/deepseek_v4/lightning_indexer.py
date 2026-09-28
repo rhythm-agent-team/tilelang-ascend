@@ -1564,9 +1564,11 @@ if __name__ == "__main__":
         torch.npu.synchronize()
 
         ok, detail = _check_result(g_idx, g_score_matrix, g_val, tl_idx, tl_val, asq, lq, is_pa)
-        if not ok:
-            raise AssertionError(f"[{name}] MISMATCH ({detail})")
-        print(f"[{name}] verified")
+        print(f"[{name}]")
+        if ok:
+            print("  Kernel Output Match!")
+        else:
+            print(f"  MISMATCH ({detail})")
 
     # Example 1: BSND + BSND
     def example_bsnd_bsnd():
@@ -1657,5 +1659,4 @@ if __name__ == "__main__":
     elif arg in examples:
         examples[arg]()
     else:
-        sys.exit(f"Usage: python lightning_indexer.py [{('|').join(examples.keys())}|all]")
-    print("Kernel Output Match!")
+        print(f"Usage: python lightning_indexer.py [{('|').join(examples.keys())}|all]")

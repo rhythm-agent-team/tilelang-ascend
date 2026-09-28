@@ -12,8 +12,12 @@ FLOAT_DTYPE = "float32"
 INDEX_DTYPE = "int64"
 INT32_DTYPE = "int32"
 
+pass_configs = {
+    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
+}
 
-@tilelang.jit()
+
+@tilelang.jit(pass_configs=pass_configs)
 def get_topk_gate_kernel(num_experts: int, num_topk: int):
     num_tokens = T.symbolic("num_tokens")
     ALIGN_SIZE = 32
