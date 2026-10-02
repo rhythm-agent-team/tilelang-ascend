@@ -98,6 +98,8 @@ class KernelCache:
             str: SHA256 hash key for the kernel configuration.
         """
 
+        from tilelang.jit.adapter.libgen import get_shmem_backend
+
         func_binary = cloudpickle.dumps(func.script())
         key_data = {
             "version": __version__,
@@ -111,6 +113,7 @@ class KernelCache:
             "platform": str(platform),
             "execution_backend": execution_backend,
             "pass_configs": pass_configs,
+            "shmem_backend": get_shmem_backend() if str(target) in ("ascendc", "auto") else None,
         }
         key_string = json.dumps(key_data, sort_keys=True)  # Sort keys to ensure consistency
         return sha256(key_string.encode()).hexdigest()  # Use SHA256 to generate hash key

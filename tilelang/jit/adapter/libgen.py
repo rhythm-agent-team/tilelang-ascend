@@ -49,6 +49,14 @@ def _get_ascend_home_path() -> str:
     return ascend_home
 
 
+def get_shmem_backend() -> str:
+    """Select the SHMEM ABI explicitly; preserve the existing HYBM default."""
+    backend = os.environ.get("TL_SHMEM_BACKEND", "hybm")
+    if backend not in ("default", "hybm"):
+        raise ValueError(f"TL_SHMEM_BACKEND must be 'default' or 'hybm', got {backend!r}")
+    return backend
+
+
 class LibraryGenerator:
     srcpath: str | None = None
     libpath: str | None = None
@@ -88,7 +96,6 @@ class LibraryGenerator:
                 f"-I{TL_ROOT}/3rdparty/catlass/include",
                 f"-I{TL_ROOT}/3rdparty/shmem/include",
                 f"-I{TL_ROOT}/3rdparty/shmem/src/device",
-                "-DBACKEND_HYBM",
                 "-I" + TILELANG_TEMPLATE_PATH,
                 f"-L{ASCEND_HOME_PATH}/lib64",
                 "-Wno-macro-redefined",
@@ -153,6 +160,8 @@ class LibraryGenerator:
             ]
             if os.environ.get("TL_PTO_DEBUG") == "1":
                 command += ["-D_DEBUG", "--cce-enable-print"]
+        if self.target in ("ascendc", "auto") and get_shmem_backend() == "hybm":
+            command += ["-DBACKEND_HYBM"]
         command += ["-o", libpath]
 
         src.write(self.lib_code)
