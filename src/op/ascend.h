@@ -158,6 +158,10 @@ TVM_DLL const Op &ascend_shmem_ub_put_nbi();
 
 TVM_DLL const Op &ascend_shmem_ub_get_nbi();
 
+TVM_DLL const Op &ascend_shmem_signal_op();
+
+TVM_DLL const Op &ascend_shmem_signal_wait_until();
+
 TVM_DLL const Op &ascend_gather_mask();
 
 TVM_DLL const Op &ascend_gatherb();

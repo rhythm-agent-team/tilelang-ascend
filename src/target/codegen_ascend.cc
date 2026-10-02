@@ -25,6 +25,7 @@
 
 #include "../op/ascend.h"
 #include "../op/builtin.h"
+#include "../transform/common/ascend_resource_scope.h"
 #include "../transform/common/ascend_vector_mask.h"
 #include "../transform/common/attr.h"
 
@@ -571,6 +572,9 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     ShmemCodegen(op);
   } else if (op->op.same_as(tl::ascend_shmem_ub_put_nbi())) {
     ShmemCodegen(op);
+  } else if (op->op.same_as(tl::ascend_shmem_signal_op()) ||
+             op->op.same_as(tl::ascend_shmem_signal_wait_until())) {
+    ShmemCodegen(op);
   } else if (op->op.same_as(tl::ascend_row_expand_mul())) {
     RowExpandMulCodegen(op);
   } else if (op->op.same_as(tl::ascend_wait_cross_flag())) {
@@ -628,35 +632,43 @@ void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
     return;
   } else if (op->attr_key == "thread_extent") {
     IterVar iv = Downcast<IterVar>(op->node);
-    if (iv->thread_tag == "blockIdx.x" && iv->var->name_hint != "_") {
-      this->block_id_ = AllocVarID(iv->var.get());
-      this->PrintIndent();
-      auto current_block_id = this->block_id_;
-      if (this->use_swizzle_) {
-        current_block_id = current_block_id + "_";
-      }
-      this->stream << "auto " << current_block_id
-                   << " = AscendC::GetBlockIdx();\n";
-      this->PrintIndent();
-      this->stream << "if ASCEND_IS_AIV {\n";
-      this->PrintIndent();
-      if (cv_ratio_ != cv_1_1) {
-        this->PrintIndent();
-        this->stream << current_block_id << " = " << current_block_id
-                     << " / 2;\n";
-      }
-      this->PrintIndent();
-      this->stream << "}\n";
-
+    if (iv->thread_tag == "blockIdx.x") {
       this->core_num_ = PrintExpr(op->value);
+      if (iv->var->name_hint != "_") {
+        this->block_id_ = AllocVarID(iv->var.get());
+        this->PrintIndent();
+        auto current_block_id = this->block_id_;
+        if (this->use_swizzle_) {
+          current_block_id = current_block_id + "_";
+        }
+        this->stream << "auto " << current_block_id
+                     << " = AscendC::GetBlockIdx();\n";
+        if (!is_aiv_kernel_) {
+          this->PrintIndent();
+          this->stream << "if ASCEND_IS_AIV {\n";
+          if (cv_ratio_ != cv_1_1) {
+            this->PrintIndent();
+            this->stream << current_block_id << " = " << current_block_id
+                         << " / 2;\n";
+          }
+          this->PrintIndent();
+          this->stream << "}\n";
+        }
+      }
     } else if (iv->thread_tag == "blockIdx.y" && iv->var->name_hint != "_") {
+      ICHECK(!is_aiv_kernel_) << "AIV kernel cannot bind blockIdx.y";
       auto vec_id_ = AllocVarID(iv->var.get());
       this->PrintIndent();
       this->stream << "auto " << vec_id_ << " = AscendC::GetSubBlockIdx();\n";
     } else if (iv->thread_tag == "threadIdx.x") {
       auto vec_id_ = AllocVarID(iv->var.get());
       this->PrintIndent();
-      this->stream << "auto " << vec_id_ << " = AscendC::GetSubBlockIdx();\n";
+      if (is_aiv_kernel_) {
+        ICHECK(is_one(op->value)) << "AIV kernel requires threads=1";
+        this->stream << "auto " << vec_id_ << " = 0;\n";
+      } else {
+        this->stream << "auto " << vec_id_ << " = AscendC::GetSubBlockIdx();\n";
+      }
     }
     this->VisitStmt(op->body);
     return;
@@ -854,7 +866,9 @@ void CodeGenTileLangAscend::VisitExpr_(const MulNode *op,
 void CodeGenTileLangAscend::PreFunctionBody(const PrimFunc &f) {
   int func_scope = this->BeginScope();
   this->PrintIndent();
-  if (cv_ratio_ == cv_1_1) {
+  if (is_aiv_kernel_) {
+    stream << "KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV);\n";
+  } else if (cv_ratio_ == cv_1_1) {
     stream << "KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);\n";
   } else {
     stream << "KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);\n";
@@ -892,23 +906,25 @@ void CodeGenTileLangAscend::PreFunctionBody(const PrimFunc &f) {
     ub_size = ASCEND_A2A3_UB_SIZE;
   }
 
-  this->PrintIndent();
-  stream << "AscendC::TBuf<AscendC::TPosition::A2> ascend_l0a;\n";
-  this->PrintIndent();
-  stream << "pipe.InitBuffer(ascend_l0a, " << l0a_size << ");\n";
-  this->PrintIndent();
-  stream << "AscendC::TBuf<AscendC::TPosition::B2> ascend_l0b;\n";
-  this->PrintIndent();
-  stream << "pipe.InitBuffer(ascend_l0b, " << l0b_size << ");\n";
+  if (!is_aiv_kernel_) {
+    this->PrintIndent();
+    stream << "AscendC::TBuf<AscendC::TPosition::A2> ascend_l0a;\n";
+    this->PrintIndent();
+    stream << "pipe.InitBuffer(ascend_l0a, " << l0a_size << ");\n";
+    this->PrintIndent();
+    stream << "AscendC::TBuf<AscendC::TPosition::B2> ascend_l0b;\n";
+    this->PrintIndent();
+    stream << "pipe.InitBuffer(ascend_l0b, " << l0b_size << ");\n";
 
-  this->PrintIndent();
-  stream << "AscendC::TBuf<AscendC::TPosition::A1> ascend_l1; "
-            "pipe.InitBuffer(ascend_l1, "
-         << l1_size << ");\n";
-  this->PrintIndent();
-  stream << "AscendC::TBuf<AscendC::TPosition::CO1> ascend_l0c; "
-            "pipe.InitBuffer(ascend_l0c, "
-         << l0c_size << ");\n";
+    this->PrintIndent();
+    stream << "AscendC::TBuf<AscendC::TPosition::A1> ascend_l1; "
+              "pipe.InitBuffer(ascend_l1, "
+           << l1_size << ");\n";
+    this->PrintIndent();
+    stream << "AscendC::TBuf<AscendC::TPosition::CO1> ascend_l0c; "
+              "pipe.InitBuffer(ascend_l0c, "
+           << l0c_size << ");\n";
+  }
   this->PrintIndent();
   stream << "AscendC::TBuf<AscendC::TPosition::VECCALC> ascend_ub; "
             "pipe.InitBuffer(ascend_ub, "
@@ -1113,6 +1129,17 @@ void CodeGenTileLangAscend::AddFunction(const GlobalVar &gvar,
   // clear previous generated state.
   this->InitFuncState(f);
   current_resource_scope_ = -1;
+  is_aiv_kernel_ = false;
+  cv_ratio_.clear();
+  core_num_ = "1";
+  para_.clear();
+  auto kernel_type = f->GetAttr<StringImm>("npu_kernel_type");
+  if (kernel_type.defined()) {
+    ICHECK_EQ(kernel_type.value()->value, "aiv")
+        << "Unsupported NPU kernel type: " << kernel_type.value()->value;
+    is_aiv_kernel_ = true;
+    tl::VerifyAscendAIVKernel(f);
+  }
   buffer_dtypes_.clear();
   for (const auto &entry : f->buffer_map) {
     buffer_dtypes_[entry.second->data.get()] = entry.second->dtype;
@@ -1547,7 +1574,15 @@ void CodeGenTileLangAscend::ShmemCodegen(const CallNode *op) {
   std::string op_name =
       "tl::ascend::" + Downcast<StringImm>(op->args[0])->value;
   int len = op->args.size();
-  PrintOpCall(op, op_name, {1, 3}, {3, len});
+  if (op->op.same_as(tl::ascend_shmem_get_nbi()) ||
+      op->op.same_as(tl::ascend_shmem_put_nbi())) {
+    PrintOpCall(op, op_name, {1, 4}, {4, len});
+  } else if (op->op.same_as(tl::ascend_shmem_signal_op()) ||
+             op->op.same_as(tl::ascend_shmem_signal_wait_until())) {
+    PrintOpCall(op, op_name, {1, 2}, {2, len});
+  } else {
+    PrintOpCall(op, op_name, {1, 3}, {3, len});
+  }
 }
 
 void CodeGenTileLangAscend::GatherMaskCodegen(const CallNode *op) {

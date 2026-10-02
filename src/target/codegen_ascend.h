@@ -274,6 +274,7 @@ private:
   std::string block_id_;
   // cv ratio in vid reduce mode
   std::string cv_ratio_;
+  bool is_aiv_kernel_{false};
 
   Map<Var, PrimExpr> address_map_;
 

@@ -38,8 +38,11 @@ def shmem_get_nbi(M, N, nelems, newPe, dtype="int8"):
         with T.Kernel(1, is_npu=True) as (cid, vid):
             with T.Scope("V"):
                 if vid == 0:
+                    scratch = T.alloc_ub((256,), dtype)
                     # Copy from the newPe GM to the local GM
-                    T.shmem_get_nbi(B, A, nelems, newPe)
+                    T.shmem_get_nbi(B, A, nelems, newPe, scratch=scratch, event_id=0)
+                    T.set_flag("mte3", "s", 0)
+                    T.wait_flag("mte3", "s", 0)
     return main
 
 def worker(rank, barrier):

@@ -41,7 +41,9 @@ def shmem_ub_put_nbi(M, N, nelems, newPe, dtype="int8"):
                 if vid == 0:
                     T.copy(A, ub_tensor)
                     # Copy from the local UB to the newPe GM
-                    T.shmem_ub_put_nbi(ub_tensor, B, nelems, newPe)
+                    T.shmem_ub_put_nbi(ub_tensor, B, nelems, newPe, event_id=0)
+                    T.set_flag("mte3", "s", 0)
+                    T.wait_flag("mte3", "s", 0)
     return main
 
 def worker(rank, barrier):

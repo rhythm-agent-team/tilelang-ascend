@@ -18,6 +18,7 @@
 
 #include "../op/ascend.h"
 #include "../op/builtin.h"
+#include "./common/ascend_resource_scope.h"
 #include "./common/ascend_vector_mask.h"
 #include "./common/collector.h"
 #include "./common/operation_config.h"
@@ -800,6 +801,10 @@ AscendResource ResourceForCall(const CallNode *call, std::string *operation) {
     }
     return AscendResource::kExplicit;
   }
+  if (call->op.same_as(ascend_shmem_signal_op()) ||
+      call->op.same_as(ascend_shmem_signal_wait_until())) {
+    return AscendResource::kVector;
+  }
   if (call->op.same_as(ascend_set_deq_scale()) ||
       IsVectorMaskSetter(call_ref) || IsSelectedVectorTerminal(call_ref)) {
     return AscendResource::kVector;
@@ -1150,16 +1155,29 @@ class ContextualResourceResolver final : public StmtMutator {
 class AscendResourceScopeVerifier final : public StmtExprVisitor {
 public:
   static PrimFunc Verify(PrimFunc func, bool require_explicit_scope) {
-    AscendResourceScopeVerifier verifier(require_explicit_scope);
+    auto kernel_type = func->GetAttr<StringImm>("npu_kernel_type");
+    bool is_aiv = kernel_type.defined() && kernel_type.value()->value == "aiv";
+    AscendResourceScopeVerifier verifier(require_explicit_scope, is_aiv);
+    if (is_aiv) {
+      for (const auto &entry : func->buffer_map) {
+        ICHECK(ResourceForStorageScope(entry.second.scope()) !=
+               AscendResource::kCube)
+            << "AIV kernel cannot contain Cube parameters: "
+            << entry.second->name;
+      }
+    }
     verifier(func->body);
     return func;
   }
 
 private:
-  explicit AscendResourceScopeVerifier(bool require_explicit_scope)
-      : require_explicit_scope_(require_explicit_scope) {}
+  explicit AscendResourceScopeVerifier(bool require_explicit_scope, bool is_aiv)
+      : require_explicit_scope_(require_explicit_scope), is_aiv_(is_aiv) {}
 
   void Check(AscendResource resource, const std::string &operation) const {
+    ICHECK(!is_aiv_ || resource != AscendResource::kCube)
+        << "AIV kernel cannot contain Cube resources or operations: "
+        << operation;
     if (resource == AscendResource::kNone ||
         resource == AscendResource::kCommon) {
       return;
@@ -1182,6 +1200,14 @@ private:
   }
 
   void VisitStmt_(const AttrStmtNode *op) final {
+    if (is_aiv_ && op->attr_key == "thread_extent") {
+      const IterVar thread = Downcast<IterVar>(op->node);
+      ICHECK(thread->thread_tag == "blockIdx.x" ||
+             thread->thread_tag == "threadIdx.x")
+          << "AIV kernel supports only blockIdx.x and threads=1";
+      ICHECK(thread->thread_tag != "threadIdx.x" || is_one(op->value))
+          << "AIV kernel requires threads=1";
+    }
     if (op->attr_key != "resource_scope") {
       StmtExprVisitor::VisitStmt_(op);
       return;
@@ -1190,6 +1216,8 @@ private:
     ICHECK(scope && (scope->value == 0 || scope->value == 1))
         << "resource_scope must be 0 (C) or 1 (V)";
     int new_scope = static_cast<int>(scope->value);
+    ICHECK(!is_aiv_ || new_scope == 1)
+        << "AIV kernel cannot contain T.Scope(\"C\")";
     ICHECK(scope_ < 0 || scope_ == new_scope)
         << "Conflicting nested T.Scope(\"" << (new_scope == 0 ? "C" : "V")
         << "\")";
@@ -1200,13 +1228,32 @@ private:
   }
 
   void VisitExpr_(const CallNode *op) final {
+    ICHECK(!is_aiv_ || !op->op.same_as(ascend_src_code()))
+        << "AIV kernel cannot contain unverified source-code injection";
     std::string operation;
     Check(ResourceForCall(op, &operation), operation);
     StmtExprVisitor::VisitExpr_(op);
   }
 
   void VisitStmt_(const CustomizedCodeNode *op) final {
+    ICHECK(!is_aiv_) << "AIV kernel cannot contain unverified CustomizedCode";
     Check(AscendResource::kExplicit, "CustomizedCode");
+  }
+
+  void VisitStmt_(const AllocateNode *op) final {
+    ICHECK(!is_aiv_ || ResourceForStorageScope(GetPtrStorageScope(
+                           op->buffer_var)) != AscendResource::kCube)
+        << "AIV kernel cannot allocate Cube storage: " << op->buffer_var;
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const BlockNode *op) final {
+    for (const auto &buffer : op->alloc_buffers) {
+      ICHECK(!is_aiv_ ||
+             ResourceForStorageScope(buffer.scope()) != AscendResource::kCube)
+          << "AIV kernel cannot allocate Cube storage: " << buffer->name;
+    }
+    StmtExprVisitor::VisitStmt_(op);
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
@@ -1229,6 +1276,7 @@ private:
   }
 
   bool require_explicit_scope_;
+  bool is_aiv_;
   int scope_{-1};
 };
 
@@ -1302,6 +1350,12 @@ private:
 class CombineCV : public arith::IRMutatorWithAnalyzer {
 public:
   static PrimFunc Substitute(PrimFunc f, PassContext ctx) {
+    auto kernel_type = f->GetAttr<StringImm>("npu_kernel_type");
+    if (kernel_type.defined() && kernel_type.value()->value == "aiv") {
+      // A single AIV owns this program; do not duplicate its scalar/control
+      // statements into a Cube program that cannot execute on this target.
+      return AscendResourceScopeVerifier::Verify(std::move(f), true);
+    }
     arith::Analyzer analyzer;
     CombineCV substituter(&analyzer);
     bool ascend_auto_combine =
@@ -1379,6 +1433,10 @@ tvm::transform::Pass AscendResourceScopeVerify() {
 
 TVM_REGISTER_GLOBAL("tl.transform.AscendResourceScopeVerify")
     .set_body_typed(AscendResourceScopeVerify);
+
+void VerifyAscendAIVKernel(const PrimFunc &func) {
+  AscendResourceScopeVerifier::Verify(func, true);
+}
 
 } // namespace tl
 } // namespace tvm

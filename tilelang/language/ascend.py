@@ -2,7 +2,7 @@ from __future__ import annotations
 import tilelang.language as T
 from tvm.tir import PrimExpr, Buffer, BufferRegion, Var
 from typing import Union, Literal  # noqa: F401, UP035
-from tvm import DataType, tir
+from tvm import DataType, arith, tir
 from tvm._ffi.runtime_ctypes import DataTypeCode
 
 
@@ -314,104 +314,245 @@ def sync_all():
     return tir.call_intrin("handle", tir.op.Op.get("tl.ascend_sync_all"))
 
 
-def shmem_put_nbi(dst: Buffer, src: Buffer, nelems: PrimExpr, newPe: PrimExpr):
-    """Performs a shmem put nbi operation.
+# Public enum values from the pinned ACLSHMEM host_device/shmem_common_types.h.
+SHMEM_SIGNAL_SET = 0
+SHMEM_SIGNAL_ADD = 1
+SHMEM_CMP_EQ = 0
+SHMEM_CMP_NE = 1
+SHMEM_CMP_GT = 2
+SHMEM_CMP_GE = 3
+SHMEM_CMP_LT = 4
+SHMEM_CMP_LE = 5
 
-    This intrinsic invokes the underlying implementation to copy from the local GM to the newPe GM
 
-    Args:
-        dst: The newPe GM.
-        src: The local GM.
-        nelems: Number of elements.
-        newPe: The rank of dst pe.
+def _shmem_buffer(arg: Buffer | BufferRegion, name: str, scope: str) -> Buffer:
+    arg = _legalize_arguments(arg)
+    if not isinstance(arg, (Buffer, BufferRegion)):
+        raise TypeError(f"{name} must be a Buffer or BufferRegion")
+    buffer = arg.buffer if isinstance(arg, BufferRegion) else arg
+    if buffer.scope() != scope:
+        raise ValueError(f"{name} must use scope {scope}, but got {buffer.scope()}")
+    analyzer = arith.Analyzer()
+    if len(buffer.strides) != 0:
+        stride = 1
+        for dimension, actual in zip(reversed(buffer.shape), reversed(buffer.strides)):
+            if not analyzer.can_prove(actual == stride):
+                raise ValueError(f"{name} must use compact row-major storage")
+            stride *= dimension
+    if isinstance(arg, BufferRegion):
+        # Contiguous slices may restrict the first varying axis, but all trailing
+        # axes must be complete. Arbitrary pitched regions are not RMA segments.
+        trailing_complete = True
+        for dimension, region in zip(reversed(buffer.shape), reversed(arg.region)):
+            extent = _get_static_int(region.extent)
+            if extent != 1 and not trailing_complete:
+                raise ValueError(f"{name} BufferRegion must be contiguous")
+            trailing_complete = trailing_complete and (
+                analyzer.can_prove(region.min == 0)
+                and analyzer.can_prove(region.extent == dimension)
+            )
+    return buffer
 
-    Returns:
-        A TVM intrinsic call that performs the shmem put nbi operation.
-    """
+
+def _shmem_int32(value: PrimExpr | int, name: str, *, nonnegative: bool = False) -> PrimExpr:
+    static = _get_static_int(value)
+    if static is not None:
+        lower = 0 if nonnegative else -(1 << 31)
+        if not lower <= static < (1 << 31):
+            raise ValueError(f"{name} must fit {'nonnegative ' if nonnegative else ''}int32")
+        return tir.const(static, "int32")
+    if not isinstance(value, PrimExpr) or value.dtype != "int32":
+        raise TypeError(f"{name} must be an int32 expression")
+    return value
+
+
+def _shmem_count(nelems: PrimExpr | int) -> PrimExpr:
+    static = _get_static_int(nelems)
+    if static is not None:
+        if not 0 < static < (1 << 32):
+            raise ValueError("SHMEM nelems must be positive and fit uint32")
+        return tir.const(static, "uint32")
+    if not isinstance(nelems, PrimExpr) or nelems.dtype not in ("int32", "uint32"):
+        raise TypeError("SHMEM nelems must be an int32 or uint32 expression")
+    return nelems
+
+
+def _shmem_scratch(scratch: Buffer | BufferRegion, dtype: str) -> tuple[PrimExpr, int]:
+    pointer = _get_tmp_arena_access_ptr("SHMEM", scratch)
+    buffer = scratch.buffer if isinstance(scratch, BufferRegion) else scratch
+    if buffer.dtype != dtype:
+        raise ValueError(f"SHMEM scratch dtype must match payload dtype {dtype}, but got {buffer.dtype}")
+    size_bytes = int(pointer.args[3]) * DataType(dtype).itemsize()
+    if size_bytes <= 0 or size_bytes % 32 != 0:
+        raise ValueError("SHMEM scratch capacity must be a positive multiple of 32 bytes")
+    if size_bytes >= (1 << 32):
+        raise ValueError("SHMEM scratch capacity must fit uint32")
+    return pointer, size_bytes
+
+
+def _shmem_gm_nbi(
+    operation: str,
+    dst: Buffer | BufferRegion,
+    src: Buffer | BufferRegion,
+    nelems: PrimExpr | int,
+    new_pe: PrimExpr | int,
+    scratch: Buffer | BufferRegion,
+    event_id: PrimExpr | int,
+) -> PrimExpr:
+    destination = _shmem_buffer(dst, "SHMEM dst", "global")
+    source = _shmem_buffer(src, "SHMEM src", "global")
+    if destination.dtype != source.dtype:
+        raise ValueError("SHMEM src and dst dtypes must match")
+    scratch_ptr, scratch_bytes = _shmem_scratch(scratch, source.dtype)
     return tir.call_intrin(
         "handle",
-        tir.op.Op.get("tl.ascend_shmem_put_nbi"),
-        f"shmem_put_nbi<{_dtype(src)}>",
-        dst.access_ptr("w"),
-        src.access_ptr("r"),
-        nelems,
-        newPe,
+        tir.op.Op.get(f"tl.ascend_shmem_{operation}_nbi"),
+        f"shmem_{operation}_nbi<{_dtype(source)}>",
+        _retrieve_ptr(dst, "w"),
+        _retrieve_ptr(src, "r"),
+        scratch_ptr,
+        scratch_bytes,
+        _shmem_count(nelems),
+        _shmem_int32(new_pe, "SHMEM PE", nonnegative=True),
+        _shmem_int32(event_id, "SHMEM event_id", nonnegative=True),
     )
 
 
-def shmem_ub_put_nbi(ub: Buffer, dst: Buffer, nelems: PrimExpr, newPe: PrimExpr, strelem: PrimExpr = 0):
-    """Performs a shmem ub put nbi operation.
+def shmem_put_nbi(
+    dst: Buffer | BufferRegion,
+    src: Buffer | BufferRegion,
+    nelems: PrimExpr | int,
+    newPe: PrimExpr | int,
+    *,
+    scratch: Buffer | BufferRegion,
+    event_id: PrimExpr | int,
+) -> PrimExpr:
+    """Issue GM-to-symmetric-GM MTE put with caller-owned UB and event.
 
-    This intrinsic invokes the underlying implementation to copy from the local UB to the newPe GM
-
-    Args:
-        ub: The local UB.
-        dst: The newPe GM.
-        nelems: Number of elements.
-        newPe: The rank of dst pe.
-
-    Returns:
-        A TVM intrinsic call that performs the shmem ub put nbi operation.
+    ``scratch`` must be a 32-byte-aligned one-dimensional UB arena with the
+    payload dtype. Keep it alive until the final MTE3 transfer completes, using
+    an explicit SetFlag/WaitFlag pair (MTE3_S before scalar publication, or
+    MTE3_MTE2 before scratch reuse). The event must not overlap another live DMA.
+    ``dst`` must belong to ACLSHMEM's symmetric heap; ``src`` may be ordinary GM.
     """
+    return _shmem_gm_nbi("put", dst, src, nelems, newPe, scratch, event_id)
+
+
+def shmem_get_nbi(
+    dst: Buffer | BufferRegion,
+    src: Buffer | BufferRegion,
+    nelems: PrimExpr | int,
+    newPe: PrimExpr | int,
+    *,
+    scratch: Buffer | BufferRegion,
+    event_id: PrimExpr | int,
+) -> PrimExpr:
+    """Issue symmetric-GM-to-GM MTE get with caller-owned UB and event.
+
+    ``src`` must be symmetric; ``dst`` may be ordinary local GM. NBI return
+    does not complete the final MTE3 transfer. The scratch/event lifetime and
+    explicit completion requirements are identical to :func:`shmem_put_nbi`.
+    """
+    return _shmem_gm_nbi("get", dst, src, nelems, newPe, scratch, event_id)
+
+
+def shmem_ub_put_nbi(
+    ub: Buffer | BufferRegion,
+    dst: Buffer | BufferRegion,
+    nelems: PrimExpr | int,
+    newPe: PrimExpr | int,
+    strelem: PrimExpr | int = 0,
+    *,
+    event_id: PrimExpr | int,
+) -> PrimExpr:
+    """Issue UB-to-symmetric-GM put; explicitly complete MTE3 before UB reuse."""
+    source = _shmem_buffer(ub, "SHMEM ub", "shared.ub")
+    destination = _shmem_buffer(dst, "SHMEM dst", "global")
+    if source.dtype != destination.dtype:
+        raise ValueError("SHMEM src and dst dtypes must match")
     return tir.call_intrin(
         "handle",
         tir.op.Op.get("tl.ascend_shmem_ub_put_nbi"),
-        f"shmem_ub_put_nbi<{_dtype(dst)}>",
-        ub.access_ptr("r"),
-        dst.access_ptr("w"),
-        nelems,
-        newPe,
-        strelem,
+        f"shmem_ub_put_nbi<{_dtype(source)}>",
+        _retrieve_ptr(ub, "r"),
+        _retrieve_ptr(dst, "w"),
+        _shmem_count(nelems),
+        _shmem_int32(newPe, "SHMEM PE", nonnegative=True),
+        _shmem_int32(strelem, "SHMEM strelem", nonnegative=True),
+        _shmem_int32(event_id, "SHMEM event_id", nonnegative=True),
     )
 
 
-def shmem_get_nbi(dst: Buffer, src: Buffer, nelems: PrimExpr, newPe: PrimExpr):
-    """Performs a shmem get nbi operation.
-
-    This intrinsic invokes the underlying implementation to copy from the newPe GM to the local GM
-
-    Args:
-        dst: The local GM.
-        src: The newPe GM.
-        nelems: Number of elements.
-        newPe: The rank of dst pe.
-
-    Returns:
-        A TVM intrinsic call that performs the shmem get nbi operation.
-    """
-    return tir.call_intrin(
-        "handle",
-        tir.op.Op.get("tl.ascend_shmem_get_nbi"),
-        f"shmem_get_nbi<{_dtype(src)}>",
-        dst.access_ptr("w"),
-        src.access_ptr("r"),
-        nelems,
-        newPe,
-    )
-
-
-def shmem_ub_get_nbi(dst: Buffer, src: Buffer, nelems: PrimExpr, newPe: PrimExpr):
-    """Performs a shmem ub get nbi operation.
-
-    This intrinsic invokes the underlying implementation to copy from the newPe GM to the local UB
-
-    Args:
-        dst: The local UB.
-        src: The newPe GM.
-        nelems: Number of elements.
-        newPe: The rank of dst pe.
-
-    Returns:
-        A TVM intrinsic call that performs the shmem ub get nbi operation.
-    """
+def shmem_ub_get_nbi(
+    dst: Buffer | BufferRegion,
+    src: Buffer | BufferRegion,
+    nelems: PrimExpr | int,
+    newPe: PrimExpr | int,
+    *,
+    event_id: PrimExpr | int,
+) -> PrimExpr:
+    """Issue symmetric-GM-to-UB get; explicitly complete MTE2 before UB reads."""
+    destination = _shmem_buffer(dst, "SHMEM dst", "shared.ub")
+    source = _shmem_buffer(src, "SHMEM src", "global")
+    if source.dtype != destination.dtype:
+        raise ValueError("SHMEM src and dst dtypes must match")
     return tir.call_intrin(
         "handle",
         tir.op.Op.get("tl.ascend_shmem_ub_get_nbi"),
-        f"shmem_ub_get_nbi<{_dtype(src)}>",
-        dst.access_ptr("w"),
-        src.access_ptr("r"),
-        nelems,
-        newPe,
+        f"shmem_ub_get_nbi<{_dtype(source)}>",
+        _retrieve_ptr(dst, "w"),
+        _retrieve_ptr(src, "r"),
+        _shmem_count(nelems),
+        _shmem_int32(newPe, "SHMEM PE", nonnegative=True),
+        _shmem_int32(event_id, "SHMEM event_id", nonnegative=True),
+    )
+
+
+def shmem_signal_op(
+    signal: Buffer | BufferRegion,
+    value: PrimExpr | int,
+    signal_op: int,
+    pe: PrimExpr | int,
+) -> PrimExpr:
+    """Update a symmetric int32 signal using SET or ADD; not a payload fence.
+
+    SET slots must have a single writer. Complete/order payload transfers before
+    publishing; this API does not provide general atomicity guarantees.
+    """
+    buffer = _shmem_buffer(signal, "SHMEM signal", "global")
+    if buffer.dtype != "int32":
+        raise ValueError("SHMEM signal must have dtype int32")
+    if _get_static_int(signal_op) not in (SHMEM_SIGNAL_SET, SHMEM_SIGNAL_ADD):
+        raise ValueError("SHMEM signal operation must be SHMEM_SIGNAL_SET or SHMEM_SIGNAL_ADD")
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.ascend_shmem_signal_op"),
+        "shmem_signal_op",
+        _retrieve_ptr(signal, "rw"),
+        _shmem_int32(value, "SHMEM signal value"),
+        int(signal_op),
+        _shmem_int32(pe, "SHMEM PE", nonnegative=True),
+    )
+
+
+def shmem_signal_wait_until(
+    signal: Buffer | BufferRegion,
+    cmp: int,
+    value: PrimExpr | int,
+) -> PrimExpr:
+    """Wait on a local int32 signal; this is not a cross-PE collective barrier."""
+    buffer = _shmem_buffer(signal, "SHMEM signal", "global")
+    if buffer.dtype != "int32":
+        raise ValueError("SHMEM signal must have dtype int32")
+    if _get_static_int(cmp) not in range(SHMEM_CMP_EQ, SHMEM_CMP_LE + 1):
+        raise ValueError("SHMEM comparison must be a public SHMEM_CMP_* constant")
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.ascend_shmem_signal_wait_until"),
+        "shmem_signal_wait_until",
+        _retrieve_ptr(signal, "r"),
+        int(cmp),
+        _shmem_int32(value, "SHMEM comparison value"),
     )
 
 

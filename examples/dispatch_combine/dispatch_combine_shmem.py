@@ -146,7 +146,7 @@ def moe_dispatch_kernel(
                     x_ub_cast32[(H + 16) // 2 + 1] = cur_send_token_id // K
                     x_ub_cast32[(H + 16) // 2 + 2] = token_in_topkid
                     sync_func("s", "mte3", 4)
-                    T.shmem_ub_put_nbi(x_ub, win_data, ub_size, dest_rank_id, (rank * Bs * local_expert_num + dest_expert_id * Bs + token_repeat_num[0]) * ub_size)     # Dispatch tokens
+                    T.shmem_ub_put_nbi(x_ub, win_data, ub_size, dest_rank_id, (rank * Bs * local_expert_num + dest_expert_id * Bs + token_repeat_num[0]) * ub_size, event_id=4)     # Dispatch tokens
                 # Send status:SetStatus
                 # Status distributed across cores
                 aiv_expert_num = total_expert_num // aiv_num
@@ -169,7 +169,7 @@ def moe_dispatch_kernel(
                     local_expert_id = cur_expert_id % local_expert_num  # Target MOE expert
                     index = (cur_expert_id - start_expert_id) * 8
                     T.copy(win_status_fp_ub[index:index+8], win_status_ub_single)
-                    T.shmem_ub_put_nbi(win_status_ub_single, win_status, 8, dest_rank_id, local_expert_id * ep_world_size * 8 + rank * 8)
+                    T.shmem_ub_put_nbi(win_status_ub_single, win_status, 8, dest_rank_id, local_expert_id * ep_world_size * 8 + rank * 8, event_id=5)
                     sync_func("mte3", "s", 5)
                 # Loop waiting for status WaitDispatch
                 aiv_expert_fp_num = T.reinterpret("float", aiv_expert_num)
@@ -337,9 +337,9 @@ def moe_combine_kernel(
                     T.copy(expand_x[tk_index, 0], x_ub)
                     T.barrier_all()
                     win_gm = token_id * K + topk_id
-                    T.shmem_ub_put_nbi(x_ub, win_data, H, to_rank_id, win_gm * H)   # Return data
+                    T.shmem_ub_put_nbi(x_ub, win_data, H, to_rank_id, win_gm * H, event_id=0)   # Return data
                     T.barrier_all()
-                    T.shmem_ub_put_nbi(status_ub, win_status, float_align_ub, to_rank_id, win_gm * float_align_ub)  # Return status
+                    T.shmem_ub_put_nbi(status_ub, win_status, float_align_ub, to_rank_id, win_gm * float_align_ub, event_id=0)  # Return status
                 T.barrier_all()
                 # Local tokens are distributed across cores with Bs.
                 token_num = Bs // aiv_num

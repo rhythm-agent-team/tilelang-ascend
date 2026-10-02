@@ -40,7 +40,9 @@ def shmem_ub_get_nbi(M, N, nelems, newPe, dtype="int8"):
             with T.Scope("V"):
                 if vid == 0:
                     # Copy from the newPe GM to the local UB
-                    T.shmem_ub_get_nbi(ub_tensor, A, nelems, newPe)
+                    T.shmem_ub_get_nbi(ub_tensor, A, nelems, newPe, event_id=0)
+                    T.set_flag("mte2", "mte3", 0)
+                    T.wait_flag("mte2", "mte3", 0)
                     T.copy(ub_tensor, B)
     return main
 

@@ -224,6 +224,10 @@ def lower(
         mod[gvar] = f.with_attr("npu_platform", platform)
 
     target = tvm.target.Target({"kind": "llvm", "model": target})
+    if target.model not in {"ascendc", "auto"}:
+        for _, function in mod.functions_items():
+            if function.attrs and "npu_kernel_type" in function.attrs:
+                raise ValueError("Explicit npu_kernel_type is only supported by the AscendC backend")
 
     # Phase 1: Lower and legalize the IR
     mod = LowerAndLegalize(mod, target)

@@ -311,6 +311,13 @@ KernelLaunchFrame KernelLaunch(Array<PrimExpr> grid_size,
     ICHECK(vid_value_node != nullptr)
         << "block_size[0] must be compile-time constant";
     int vid_value = vid_value_node->value;
+    auto kernel_type = attrs.find("npu_kernel_type");
+    if (kernel_type != attrs.end()) {
+      String type = Downcast<String>((*kernel_type).second);
+      ICHECK_EQ(type, "aiv") << "Unsupported NPU kernel type: " << type;
+      ICHECK_EQ(vid_value, 1) << "AIV kernel requires threads=1";
+      prim_func_frame->attrs.Set("npu_kernel_type", StringImm(type));
+    }
     if (vid_value == 1) {
       prim_func_frame->attrs.Set("npu_cv_ratio", StringImm(cv_1_1));
     } else {

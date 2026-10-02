@@ -219,6 +219,7 @@ def Kernel(
     prelude: str | None = None,
     is_npu: bool = False,
     pipeline: bool = False,
+    kernel_type: str | None = None,
 ):
     """Tools to quickly construct a GPU kernel launch frame.
 
@@ -237,6 +238,10 @@ def Kernel(
     prelude : str
         The import c code of the kernel,
         will be injected before the generated kernel code.
+    kernel_type : str | None
+        Explicit Ascend kernel type. ``"aiv"`` selects a Vector-only AscendC
+        kernel with one physical AIV per block and requires ``is_npu=True``
+        and ``threads=1``. The default preserves the existing MIX kernel.
 
     Returns
     -------
@@ -244,6 +249,15 @@ def Kernel(
         The result LaunchThreadFrame.
     """
     attrs: dict = {}
+    if kernel_type is not None:
+        if kernel_type != "aiv":
+            raise ValueError(f"Unsupported kernel_type={kernel_type!r}; expected 'aiv' or None")
+        if not is_npu or is_cpu:
+            raise ValueError("kernel_type='aiv' requires is_npu=True and is_cpu=False")
+        aiv_threads = [threads] if isinstance(threads, int) else threads
+        if aiv_threads not in ([1], (1,)):
+            raise ValueError("kernel_type='aiv' requires threads=1")
+        attrs["npu_kernel_type"] = kernel_type
     if is_npu:
         assert len(blocks) == 1, "NPU kernel must have exactly one block dimension"
         if threads is None:
