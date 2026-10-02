@@ -551,6 +551,8 @@ class TileLangBuilPydCommand(build_py):
         SHMEM_PREBUILD_ITEMS = [
             "3rdparty/shmem/include",
             "3rdparty/shmem/src/device",
+            "3rdparty/shmem/src/device_simt",
+            "3rdparty/shmem/src/host_device",
         ]
         for item in SHMEM_PREBUILD_ITEMS:
             source_dir = os.path.join(ROOT_DIR, item)
