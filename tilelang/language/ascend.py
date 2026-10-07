@@ -314,6 +314,57 @@ def sync_all():
     return tir.call_intrin("handle", tir.op.Op.get("tl.ascend_sync_all"))
 
 
+# Values from aclshmem_cmp_op_type_t in shmem_common_types.h.
+ACLSHMEM_CMP_EQ = 0
+ACLSHMEM_CMP_NE = 1
+ACLSHMEM_CMP_GT = 2
+ACLSHMEM_CMP_GE = 3
+ACLSHMEM_CMP_LT = 4
+ACLSHMEM_CMP_LE = 5
+
+
+def shmem_int32_wait_until(flag_ptr: PrimExpr, cmp: PrimExpr | int, value: PrimExpr | int):
+    """Call aclshmem_int32_wait_until(flag_ptr, cmp, value) on local int32 GM.
+
+    Pass T.address_of(flags[index]) or flags.access_ptr("r", offset=index, extent=1).
+    The pointed-to flag must be in symmetric memory. cmp accepts ACLSHMEM_CMP_EQ,
+    NE, GT, GE, LT and LE, or a runtime int32 containing one of those values.
+    This wait does not complete outstanding transfers or order payload accesses.
+    """
+    if isinstance(flag_ptr, Var) and T.has_let_value(flag_ptr):
+        flag_ptr = T.get_let_value(flag_ptr)
+    if isinstance(flag_ptr, tir.Call) and flag_ptr.op.same_as(tir.op.Op.get("tir.address_of")):
+        load = flag_ptr.args[0]
+        if not isinstance(load, tir.BufferLoad):
+            raise TypeError("shmem_int32_wait_until address_of requires a Buffer element")
+        flag_ptr = load.buffer.access_ptr(
+            "r", offset=load.buffer.offset_of(load.indices)[-1], extent=1
+        )
+    if not isinstance(flag_ptr, tir.Call) or not flag_ptr.op.same_as(
+        tir.op.Op.get("tir.tvm_access_ptr")
+    ):
+        raise TypeError("shmem_int32_wait_until requires an int32 GM access pointer")
+    if flag_ptr.args[0].dtype != "int32":
+        raise TypeError("shmem_int32_wait_until requires an int32 pointer")
+    if isinstance(cmp, int):
+        cmp = tir.const(cmp, "int32")
+    if not isinstance(cmp, PrimExpr) or cmp.dtype != "int32":
+        raise TypeError("shmem_int32_wait_until requires an int32 cmp")
+    if isinstance(cmp, tir.IntImm) and not ACLSHMEM_CMP_EQ <= int(cmp) <= ACLSHMEM_CMP_LE:
+        raise ValueError("shmem_int32_wait_until cmp must be an ACLSHMEM_CMP_* value")
+    if isinstance(value, int):
+        value = tir.const(value, "int32")
+    if not isinstance(value, PrimExpr) or value.dtype != "int32":
+        raise TypeError("shmem_int32_wait_until requires an int32 value")
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.ascend_shmem_int32_wait_until"),
+        flag_ptr,
+        cmp,
+        value,
+    )
+
+
 def shmem_put_nbi(dst: Buffer, src: Buffer, nelems: PrimExpr, newPe: PrimExpr):
     """Performs a shmem put nbi operation.
 
@@ -571,7 +622,8 @@ def _src_code(source_code: str, *args):
 
     Args:
         source_code (str): Raw C++/AscendC source code to inject.
-        *args: Additional arguments that serve as placeholders.
+        *args: Retained in the intrinsic, but not substituted by Ascend codegen.
+            Only source_code is emitted; do not use these as placeholders.
 
     Returns:
         tvm.tir.Call: A TIR intrinsic call to ``tl.ascend_src_code``.

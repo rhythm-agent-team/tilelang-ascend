@@ -1195,6 +1195,11 @@ TIR_DEFINE_TL_BUILTIN(ascend_topk)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ascend_shmem_int32_wait_until)
+    .set_num_inputs(3)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ascend_shmem_put_nbi)
     .set_num_inputs(5)
     .set_attr<TCallEffectKind>("TCallEffectKind",

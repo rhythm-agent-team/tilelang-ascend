@@ -150,6 +150,8 @@ TVM_DLL const Op &ascend_merge_sort();
 
 TVM_DLL const Op &ascend_topk();
 
+TVM_DLL const Op &ascend_shmem_int32_wait_until();
+
 TVM_DLL const Op &ascend_shmem_put_nbi();
 
 TVM_DLL const Op &ascend_shmem_get_nbi();

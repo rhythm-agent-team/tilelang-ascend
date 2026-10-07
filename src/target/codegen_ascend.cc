@@ -611,6 +611,35 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     MergeSortCodegen(op);
   } else if (op->op.same_as(tl::ascend_topk())) {
     TopKCodegen(op);
+  } else if (op->op.same_as(tl::ascend_shmem_int32_wait_until())) {
+    ICHECK_EQ(op->args.size(), 3U);
+    const auto *ptr = op->args[0].as<CallNode>();
+    ICHECK(ptr && ptr->op.same_as(builtin::tvm_access_ptr()))
+        << "shmem_int32_wait_until requires a buffer access pointer";
+    ICHECK(GetAccessPtrDtype(ptr) == DataType::Int(32))
+        << "shmem_int32_wait_until requires int32 flags";
+    const auto scope = GetPtrStorageScope(Downcast<Var>(ptr->args[1]));
+    ICHECK(scope.empty() || scope == "global")
+        << "shmem_int32_wait_until requires GM flags";
+    ICHECK(op->args[1].dtype() == DataType::Int(32))
+        << "shmem_int32_wait_until requires an int32 cmp";
+    ICHECK(op->args[2].dtype() == DataType::Int(32))
+        << "shmem_int32_wait_until requires an int32 value";
+    const auto flag = PrintBufferOffset(ptr, true);
+    std::string cmp = PrintExpr(op->args[1]);
+    if (const auto *imm = op->args[1].as<IntImmNode>()) {
+      static const char *const comparisons[] = {
+          "ACLSHMEM_CMP_EQ", "ACLSHMEM_CMP_NE", "ACLSHMEM_CMP_GT",
+          "ACLSHMEM_CMP_GE", "ACLSHMEM_CMP_LT", "ACLSHMEM_CMP_LE"};
+      ICHECK(imm->value >= 0 && imm->value < 6)
+          << "shmem_int32_wait_until requires a valid ACLSHMEM_CMP_*";
+      cmp = comparisons[imm->value];
+    }
+    const auto value = PrintExpr(op->args[2]);
+    this->PrintIndent();
+    this->stream << "aclshmem_int32_wait_until(const_cast<__gm__ int32_t *>("
+                 << flag << ".GetPhyAddr()), " << cmp << ", " << value
+                 << ");\n";
   } else if (op->op.same_as(tl::ascend_shmem_get_nbi())) {
     ShmemCodegen(op);
   } else if (op->op.same_as(tl::ascend_shmem_put_nbi())) {
