@@ -38,11 +38,9 @@ def shmem_wait_kernel(rank, rounds):
                     T.shmem_ub_put_nbi(flag, slots, 1, 1, strelem=READY)
                     T.set_flag("mte3", "s", 0)
                     T.wait_flag("mte3", "s", 0)
-                    T.shmem_int32_wait_until(T.address_of(slots[ACK]), T.ACLSHMEM_CMP_EQ,
-                                             generation)
+                    T.shmem_int32_wait_until(slots[ACK], T.ShmemCmp.EQ, generation)
                 else:
-                    T.shmem_int32_wait_until(T.address_of(slots[READY]), T.ACLSHMEM_CMP_EQ,
-                                             generation)
+                    T.shmem_int32_wait_until(slots[READY], T.ShmemCmp.EQ, generation)
                     T.copy(slots[:ELEMENTS], data)
                     T.set_flag("mte2", "mte3", 0)
                     T.wait_flag("mte2", "mte3", 0)

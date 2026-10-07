@@ -8,9 +8,12 @@ Python processes and an exact result check.
 
 Rank 0 sends payload, completes the transfer, publishes READY and waits for ACK.
 Rank 1 waits for READY, saves payload and publishes ACK after consumption.
-Both use `T.shmem_int32_wait_until(flag_ptr, T.ACLSHMEM_CMP_EQ, value)` with a
-positive generation per round. MTE/scalar events order payload and flag writes;
-the wait itself does not complete outstanding transfers. Every round's payload
+Both use `T.shmem_int32_wait_until(slots[index], T.ShmemCmp.EQ, value)` with a
+positive generation per round. The wait accepts an int32 GM buffer element
+with a constant or runtime index, `T.address_of(slots[index])`, or an access
+pointer. `T.ShmemCmp` provides `EQ`, `NE`, `GT`, `GE`, `LT` and `LE`; a runtime
+int32 comparison is also supported. MTE/scalar events order payload and flag
+writes; the wait itself does not complete outstanding transfers. Every round's payload
 is retained and checked. Each rank runs one AIV block.
 
 Run inside an NPU container with TileLang and SHMEM initialized in the environment:
